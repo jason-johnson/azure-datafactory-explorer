@@ -1,32 +1,47 @@
 
 import argparse
 import asyncio
+import aiohttp
 import logging
-import subprocess
 import sys
-import requests
-import json
+import itertools
 from azure.identity import DefaultAzureCredential
 
-# datasets and linkedservices
+logger = logging.getLogger(__name__)
 
 # pipeline -> dataset -> linkservices
+    
+async def get_factories(subscription_id, headers, session):
+    log = logger.getChild(get_factories.__name__)
+    log.debug(f"processing subscription_id {subscription_id}")
+    url = f"https://management.azure.com/subscriptions/{subscription_id}/providers/Microsoft.DataFactory/factories?api-version=2018-06-01"
+    try:        
+        async with session.get(url, headers=headers) as response:
+            if response.status == 200:
+                response_data = await response.json()
+                log.info(f"Subscription: {subscription_id} processed successfully.")
+                values = response_data.get("value")
+                result = []
+                for v in values:
+                    result.append(v.get("name"))
+                return result
+            else:
+                text = await response.text()
+                log.error(f"Subscription: {subscription_id}, Response Code: {response.status} Error: {text}")
+                return []
+    except asyncio.TimeoutError as e:
+        log.error(f"Timeout error for {subscription_id}")
+        return []
+    except Exception as e:
+        log.error(f"Unable to get url {url} due to {e}")
+        return []
+    
+async def get(subscription_id, headers, session):
+    log = logger.getChild(get.__name__)
+    log.debug(f"processing subscription_id {subscription_id}")
+    factories = await get_factories(subscription_id, headers, session)
 
-
-
-def get(url, headers, fields):
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        data = json.loads(response.text)
-        val = data.get("value")
-        result = []
-        for f in fields:
-            for v in val:
-                result.append(v.get(f))
-        return result
-    else:
-        print(f'Request failed:  {response.status_code} {response.text}')
-        return None
+    return factories
 
 # needs: subscription ids to scan, input/output types to record
 # val[0]['properties']['activities'][1]['inputs'][0]['type']
@@ -36,24 +51,28 @@ async def main():
     parser = argparse.ArgumentParser(description="Test Image Processing")
     parser.add_argument("--subscription_id", nargs="+", help="Subscription IDs to scan", required=True)
     parser.add_argument("--type", nargs="+", help="Types to record", required=True)
+    parser.add_argument("--concurrent", type=int, help="Number of concurrent requests", default=1)
     parser.add_argument('-v', '--verbose', action='count', help="Increase logging level", default=0)
     args = parser.parse_args()
 
     if args.verbose == 1:
-        logging.getLogger().setLevel(logging.INFO)
+        logger.setLevel(logging.INFO)
     elif args.verbose > 1:
-        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
 
     default_credential = DefaultAzureCredential()
 
-    subscription_id = "7a2964f4-70b7-4541-aa12-7a134b79e105"
-    resource_group = "adf-test"
-
     headers = { 'Authorization': 'Bearer '+ default_credential.get_token('https://management.azure.com/.default').token }
 
-    factory = get(f"https://management.azure.com/subscriptions/{subscription_id}/providers/Microsoft.DataFactory/factories?api-version=2018-06-01", headers, ["name"])
+    conn = aiohttp.TCPConnector(limit=args.concurrent)
+    # set total=None because the POST is really slow and the defeault will cause any request still waiting to be processed after "total" seconds to fail.  Also set read to 10 minutes
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=600)
 
-    print(factory)
+    async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
+        results = await asyncio.gather(*(get(subscription_id, headers, session) for subscription_id in args.subscription_id))
+
+        print(list(itertools.chain(*results)))
+
     return
 
     pipelines = get(f"https://management.azure.com/subscriptions/{subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.DataFactory/factories/{factory[0]}/pipelines?api-version=2018-06-01", headers, "XXX")
