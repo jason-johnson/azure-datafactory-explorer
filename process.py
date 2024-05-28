@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # pipeline -> dataset -> linkservices
     
-async def get_factories(subscription_id, headers, session):
+async def get_factories(accepted_types, subscription_id, headers, session):
     log = logger.getChild(get_factories.__name__)
     log.debug(f"processing subscription_id {subscription_id}")
     url = f"https://management.azure.com/subscriptions/{subscription_id}/providers/Microsoft.DataFactory/factories?api-version=2018-06-01"
@@ -27,7 +27,7 @@ async def get_factories(subscription_id, headers, session):
                     name = v.get("name")
                     id = v.get("id")
                     match = re.search(r"resourceGroups/([^/]+)/providers", id)
-                    result.append((name, match.group(1)))
+                    result.append(await get_pipelines(accepted_types, subscription_id, match.group(1), name, headers, session))
                 return result
             else:
                 text = await response.text()
@@ -40,7 +40,7 @@ async def get_factories(subscription_id, headers, session):
         log.error(f"Unable to get url {url} ({subscription_id}) due to {e}")
         return []
     
-async def get_pipelines(subscription_id, resource_group, factory, headers, session):
+async def get_pipelines(accepted_types, subscription_id, resource_group, factory, headers, session):
     log = logger.getChild(get_pipelines.__name__)
     log.debug(f"processing subscription_id:factory {subscription_id}:{factory}")
     url = f"https://management.azure.com/subscriptions/{subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.DataFactory/factories/{factory}/pipelines?api-version=2018-06-01"
@@ -53,9 +53,16 @@ async def get_pipelines(subscription_id, resource_group, factory, headers, sessi
                 result = []
                 for v in values:
                     name = v.get("name")
-                    id = v.get("id")
-                    match = re.search(r"resourceGroups/([^/]+)/providers", id)
-                    result.append((name, match.group(1)))
+                    properties = v.get("properties")
+                    activities = properties.get("activities")
+                    for activity in activities:
+                        activity_name = activity.get("name")
+                        activity_type = activity.get("type")
+                        inputs = activity.get("inputs")
+                        for input in inputs:
+                            type = input.get("type")
+                            if type in accepted_types:
+                                result.append((name, type))
                 return result
             else:
                 text = await response.text()
@@ -68,10 +75,10 @@ async def get_pipelines(subscription_id, resource_group, factory, headers, sessi
         log.error(f"Unable to get url {url} ({subscription_id}:{factory}) due to {e}")
         return []
     
-async def get(subscription_id, headers, session):
+async def get(accepted_types, subscription_id, headers, session):
     log = logger.getChild(get.__name__)
     log.debug(f"processing subscription_id {subscription_id}")
-    factories = await get_factories(subscription_id, headers, session)
+    factories = await get_factories(accepted_types, subscription_id, headers, session)
 
     return (subscription_id, factories)
 
@@ -101,7 +108,7 @@ async def main():
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=600)
 
     async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
-        results = await asyncio.gather(*(get(subscription_id, headers, session) for subscription_id in args.subscription_id))
+        results = await asyncio.gather(*(get(args.type, subscription_id, headers, session) for subscription_id in args.subscription_id))
 
         print(results)
 
