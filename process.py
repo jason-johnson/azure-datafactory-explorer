@@ -18,7 +18,8 @@ class Factory:
         self.name = name
         self.pipelines = []
         self.dataflows = set()
-        self.datasets = set()
+        self.datasets = {}
+        self.linkservices = {}
         self.log = logger.getChild(__class__.__name__)
 
     def add_pipeline(self, pipeline):
@@ -31,10 +32,22 @@ class Factory:
         self.dataflows.add(reference_name)
 
     def add_dataset(self, reference_name):
-        self.datasets.add(reference_name)
+        self.datasets[reference_name] = {}
+
+    def add_dataset_info(self, reference_name, info):
+        self.datasets[reference_name] = info
+
+    def add_linkservice(self, reference_name):
+        self.linkservices[reference_name] = {}
+
+    def add_linkservice_info(self, reference_name, info):
+        self.linkservices[reference_name] = info
 
     def __str__(self):
         return f"Factory: {self.name} {self.subscription_id} {self.resource_group}"
+    
+    def __repr__(self) -> str:
+        return f"Factory = {{ name={self.name}, subscription_id={self.subscription_id}, resource_group={self.resource_group}, pipelines={self.pipelines}, dataflows={self.dataflows}, datasets={self.datasets}, linkedservices={self.linkservices} }}"
     
 class Pipeline:
     def __init__(self, name):
@@ -46,8 +59,9 @@ class Pipeline:
 
     def __str__(self):
         return f"Pipeline: {self.name} {self.pipeline}"
-
-# pipeline -> dataset -> linkservices
+    
+    def __repr__(self) -> str:
+        return f"{{ Pipeline: {self.name} {self.activities} }}"
     
 async def get_factories(subscription_id, headers, session):
     log = logger.getChild(get_factories.__name__)
@@ -164,17 +178,17 @@ async def get_dataflows(factory, dataflow, headers, session):
                     ds = ss.get("dataset")
                     ref_name = ds.get("referenceName")
                     dataset_ref_names.append(ref_name)
-                return dataset_ref_names
+                return (factory, dataset_ref_names)
             else:
                 text = await response.text()
                 log.error(f"Subscription: {factory.subscription_id}, Response Code: {response.status} Error: {text}")
-                return []
+                return (factory, [])
     except asyncio.TimeoutError as e:
         log.error(f"Timeout error for {factory.subscription_id}:{factory}")
-        return []
+        return (factory, [])
     except Exception as e:
         log.error(f"Unable to get url {url} ({factory.subscription_id}:{factory}) due to {e}")
-        return []
+        return (factory, [])
     
 async def get_datasets(factory, dataset, headers, session):
     log = logger.getChild(get_datasets.__name__)
@@ -186,32 +200,72 @@ async def get_datasets(factory, dataset, headers, session):
                 response_data = await response.json()
                 log.info(f"Dataset {factory.subscription_id}:{factory.name}:{dataset} processed successfully.")
                 props = response_data.get("properties")
+                linked_service_name = props.get("linkedServiceName")
+                linked_service_ref = linked_service_name.get("referenceName")
                 type_props = props.get("typeProperties")
-                linked_services = type_props.get("linkedServices")
-                return linked_services
+                props_type = props.get("type")
+                if props_type == 'Json':
+                    return (factory, dataset, type_props.get("location"), linked_service_ref)
+                elif props_type == 'AzureSqlTable':
+                    return (factory, dataset, type_props, linked_service_ref)
+                else:
+                    log.debug(f"Dataset {dataset} type {props_type} not handled")
             else:
                 text = await response.text()
                 log.error(f"Subscription: {factory.subscription_id}, Response Code: {response.status} Error: {text}")
-                return []
     except asyncio.TimeoutError as e:
         log.error(f"Timeout error for {factory.subscription_id}:{factory}")
-        return []
     except Exception as e:
         log.error(f"Unable to get url {url} ({factory.subscription_id}:{factory}) due to {e}")
-        return []
+
+    return (factory, None, None)
+
+async def get_linkedservices(factory, linked_service, headers, session):
+    log = logger.getChild(get_linkedservices.__name__)
+    log.debug(f"processing subscription_id:factory:linked_service {factory.subscription_id}:{factory.name}:{linked_service}")
+    url = f"https://management.azure.com/subscriptions/{factory.subscription_id}/resourceGroups/{factory.resource_group}/providers/Microsoft.DataFactory/factories/{factory.name}/linkedservices/{linked_service}?api-version=2018-06-01"
+    try:        
+        async with session.get(url, headers=headers) as response:
+            if response.status == 200:
+                response_data = await response.json()
+                log.info(f"LinkedService {factory.subscription_id}:{factory.name}:{linked_service} processed successfully.")
+                props = response_data.get("properties")
+                props_type = props.get("type")
+                type_props = props.get("typeProperties")
+                if props_type == 'AzureBlobStorage' or props_type == 'AzureSqlDatabase':
+                    return (factory, linked_service, type_props)
+                else:
+                    log.debug(f"LinkedService {linked_service} type {props_type} not handled")
+            else:
+                text = await response.text()
+                log.error(f"Subscription: {factory.subscription_id}, Response Code: {response.status} Error: {text}")
+    except asyncio.TimeoutError as e:
+        log.error(f"Timeout error for {factory.subscription_id}:{factory}")
+    except Exception as e:
+        log.error(f"Unable to get url {url} ({factory.subscription_id}:{factory}) due to {e}")
+
+    return (factory, None, None)
     
 async def get(subscription_id, headers, session):
     log = logger.getChild(get.__name__)
     log.debug(f"processing subscription_id {subscription_id}")
     factories = await get_factories(subscription_id, headers, session)
-    dataset_ref_names = await asyncio.gather(*(get_dataflows(factory, dataflow, headers, session) for factory in factories for dataflow in factory.dataflows))
-    for dataset_ref_name in itertools.chain(*dataset_ref_names):
-        for factory in factories:
-            factory.add_dataset(dataset_ref_name)
-    linked_services = await asyncio.gather(*(get_datasets(factory, dataset, headers, session) for factory in factories for dataset in factory.datasets))
-    
 
-    return (subscription_id, factories, linked_services)
+    dataflow_info = await asyncio.gather(*(get_dataflows(factory, dataflow, headers, session) for factory in factories for dataflow in factory.dataflows))
+    for (factory, dataset_ref_names) in dataflow_info:
+        for dataset_ref_name in dataset_ref_names:
+            factory.add_dataset(dataset_ref_name)
+
+    dataset_info = await asyncio.gather(*(get_datasets(factory, dataset, headers, session) for factory in factories for dataset in factory.datasets.keys()))
+    for (factory, dataset, info, linked_service_ref) in dataset_info:
+        factory.add_dataset_info(dataset, info)
+        factory.add_linkservice(linked_service_ref)
+    
+    linkedservice_info = await asyncio.gather(*(get_linkedservices(factory, linked_service, headers, session) for factory in factories for linked_service in factory.linkservices.keys()))
+    for (factory, linkedservice, info) in linkedservice_info:
+        factory.add_linkservice_info(linkedservice, info)
+
+    return (subscription_id, factories)
 
 async def main():
     parser = argparse.ArgumentParser(description="Test Image Processing")
