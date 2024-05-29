@@ -17,8 +17,9 @@ class Factory:
         self.resource_group = resource_group
         self.name = name
         self.pipelines = []
-        self.dataflows = []
-        self.datasets = []
+        self.dataflows = set()
+        self.datasets = set()
+        self.log = logger.getChild(__class__.__name__)
 
     def add_pipeline(self, pipeline):
         self.pipelines.append(pipeline)
@@ -26,11 +27,11 @@ class Factory:
     def add_pipelines(self, pipelines):
         self.pipelines.extend(pipelines)
 
-    def add_dataflow(self, dataflow):
-        self.dataflows.append(dataflow)
+    def add_dataflow(self, reference_name):
+        self.dataflows.add(reference_name)
 
-    def add_dataset(self, datasets):
-        self.datasets.append(datasets)
+    def add_dataset(self, reference_name):
+        self.datasets.add(reference_name)
 
     def __str__(self):
         return f"Factory: {self.name} {self.subscription_id} {self.resource_group}"
@@ -45,23 +46,6 @@ class Pipeline:
 
     def __str__(self):
         return f"Pipeline: {self.name} {self.pipeline}"
-
-
-class DataFlowReference:
-    def __init__(self, name, reference_name):
-        self.name = name
-        self.reference_name = reference_name
-
-    def __str__(self):
-        return f"DataFlow: {self.name} {self.reference_name}"
-    
-class DataSetReference:
-    def __init__(self, name, reference_name):
-        self.name = name
-        self.reference_name = reference_name
-
-    def __str__(self):
-        return f"DataSet: {self.name} {self.reference_name}"
 
 # pipeline -> dataset -> linkservices
     
@@ -104,18 +88,32 @@ async def handle_activity(activity, factory):
         type_props = activity.get("typeProperties")
         df = type_props.get("dataflow")
         ref_name = df.get("referenceName")
-        return DataFlowReference(factory, activity_name, ref_name)
+        df_type = df.get("type")
+        if df_type == 'DataFlowReference':
+            factory.add_dataflow(ref_name)
+        else:
+            log.debug(f"ExecuteDataFlow DataFlow type {df_type} not handled")
     elif activity_type == 'Copy':
         inputs = activity.get("inputs")
         outputs = activity.get("outputs")
         for io in itertools.chain(inputs, outputs):
-            type = io.get("type")
-            return DataSetReference(factory, activity_name, io.get("referenceName"))
+            ref_type = io.get("type")
+            ref_name = io.get("referenceName")
+            if ref_type == 'DatasetReference':
+                factory.add_dataset(ref_name)
+            else:
+                log.debug(f"Copy DataSet type {ref_type} not handled")
     elif activity_type == 'Lookup':
-        return None
+        type_props = activity.get("typeProperties")
+        ds = type_props.get("dataset")
+        ref_name = ds.get("referenceName")
+        ref_type = ds.get("type")
+        if ref_type == 'DatasetReference':
+            factory.add_dataset(ref_name)
+        else:
+            log.debug(f"Lookup DataSet type {ref_type} not handled")
     else:
         log.debug(f"Activity type {activity_type} not handled")
-        return None
     
 async def get_pipelines(factory, headers, session):
     log = logger.getChild(get_pipelines.__name__)
@@ -131,6 +129,7 @@ async def get_pipelines(factory, headers, session):
                 for v in values:
                     name = v.get("name")
                     pipeline = Pipeline(name)
+                    factory.add_pipeline(pipeline)
                     properties = v.get("properties")
                     activities = properties.get("activities")
                     for activity in activities:
@@ -146,13 +145,73 @@ async def get_pipelines(factory, headers, session):
     except Exception as e:
         log.error(f"Unable to get url {url} ({factory.subscription_id}:{factory}) due to {e}")
         return []
+
+async def get_dataflows(factory, dataflow, headers, session):
+    log = logger.getChild(get_dataflows.__name__)
+    log.debug(f"processing subscription_id:factory:dataflow {factory.subscription_id}:{factory.name}:{dataflow}")
+    url = f"https://management.azure.com/subscriptions/{factory.subscription_id}/resourceGroups/{factory.resource_group}/providers/Microsoft.DataFactory/factories/{factory.name}/dataflows/{dataflow}?api-version=2018-06-01"
+    try:        
+        async with session.get(url, headers=headers) as response:
+            if response.status == 200:
+                response_data = await response.json()
+                log.info(f"Dataflow {factory.subscription_id}:{factory.name}:{dataflow} processed successfully.")
+                props = response_data.get("properties")
+                type_props = props.get("typeProperties")
+                sources = type_props.get("sources")
+                sinks = type_props.get("sinks")
+                dataset_ref_names = []
+                for ss in itertools.chain(sources, sinks):
+                    ds = ss.get("dataset")
+                    ref_name = ds.get("referenceName")
+                    dataset_ref_names.append(ref_name)
+                return dataset_ref_names
+            else:
+                text = await response.text()
+                log.error(f"Subscription: {factory.subscription_id}, Response Code: {response.status} Error: {text}")
+                return []
+    except asyncio.TimeoutError as e:
+        log.error(f"Timeout error for {factory.subscription_id}:{factory}")
+        return []
+    except Exception as e:
+        log.error(f"Unable to get url {url} ({factory.subscription_id}:{factory}) due to {e}")
+        return []
+    
+async def get_datasets(factory, dataset, headers, session):
+    log = logger.getChild(get_datasets.__name__)
+    log.debug(f"processing subscription_id:factory:dataset {factory.subscription_id}:{factory.name}:{dataset}")
+    url = f"https://management.azure.com/subscriptions/{factory.subscription_id}/resourceGroups/{factory.resource_group}/providers/Microsoft.DataFactory/factories/{factory.name}/datasets/{dataset}?api-version=2018-06-01"
+    try:        
+        async with session.get(url, headers=headers) as response:
+            if response.status == 200:
+                response_data = await response.json()
+                log.info(f"Dataset {factory.subscription_id}:{factory.name}:{dataset} processed successfully.")
+                props = response_data.get("properties")
+                type_props = props.get("typeProperties")
+                linked_services = type_props.get("linkedServices")
+                return linked_services
+            else:
+                text = await response.text()
+                log.error(f"Subscription: {factory.subscription_id}, Response Code: {response.status} Error: {text}")
+                return []
+    except asyncio.TimeoutError as e:
+        log.error(f"Timeout error for {factory.subscription_id}:{factory}")
+        return []
+    except Exception as e:
+        log.error(f"Unable to get url {url} ({factory.subscription_id}:{factory}) due to {e}")
+        return []
     
 async def get(subscription_id, headers, session):
     log = logger.getChild(get.__name__)
     log.debug(f"processing subscription_id {subscription_id}")
     factories = await get_factories(subscription_id, headers, session)
+    dataset_ref_names = await asyncio.gather(*(get_dataflows(factory, dataflow, headers, session) for factory in factories for dataflow in factory.dataflows))
+    for dataset_ref_name in itertools.chain(*dataset_ref_names):
+        for factory in factories:
+            factory.add_dataset(dataset_ref_name)
+    linked_services = await asyncio.gather(*(get_datasets(factory, dataset, headers, session) for factory in factories for dataset in factory.datasets))
+    
 
-    return (subscription_id, factories)
+    return (subscription_id, factories, linked_services)
 
 async def main():
     parser = argparse.ArgumentParser(description="Test Image Processing")
